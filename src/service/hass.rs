@@ -15,10 +15,23 @@ use async_channel::Receiver;
 use mosquitto_rs::router::{MqttRouter, Params, Payload, State};
 use mosquitto_rs::{Client, Event, QoS};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 const HASS_REGISTER_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(15);
+static HASS_STATUS_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn registration_generation_for_status(status: &str) -> Option<u64> {
+    let generation = HASS_STATUS_GENERATION
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1);
+    (status == "online").then_some(generation)
+}
+
+fn registration_generation_is_current(generation: u64) -> bool {
+    HASS_STATUS_GENERATION.load(Ordering::SeqCst) == generation
+}
 
 #[derive(clap::Parser, Debug)]
 pub struct HassArguments {
@@ -487,13 +500,23 @@ async fn mqtt_homeassitant_status(
     Payload(status): Payload<String>,
     State(state): State<StateHandle>,
 ) -> anyhow::Result<()> {
+    let Some(generation) = registration_generation_for_status(&status) else {
+        log::info!("Home Assistant status changed: {status}; cancelling pending re-registration");
+        return Ok(());
+    };
+
+    log::info!("Home Assistant status changed: {status}, waiting {HASS_REGISTER_DELAY:?} before re-registering entities");
+    tokio::time::sleep(HASS_REGISTER_DELAY).await;
+
+    if !registration_generation_is_current(generation) {
+        log::info!("A newer Home Assistant status superseded this re-registration");
+        return Ok(());
+    }
+
     let client = state
         .get_hass_client()
         .await
         .expect("hass client to be present");
-
-    log::info!("Home Assistant status changed: {status}, waiting {HASS_REGISTER_DELAY:?} before re-registering entities");
-    tokio::time::sleep(HASS_REGISTER_DELAY).await;
 
     client.register_with_hass(&state).await?;
 
@@ -741,5 +764,18 @@ mod tests {
     #[test]
     fn test_camel_case_emoji() {
         assert_eq!(camel_case_to_space_separated("🔥lightMode"), "🔥light Mode");
+    }
+
+    #[test]
+    fn test_home_assistant_status_debounces_registration() {
+        let first_online = registration_generation_for_status("online").unwrap();
+        assert!(registration_generation_is_current(first_online));
+
+        let second_online = registration_generation_for_status("online").unwrap();
+        assert!(!registration_generation_is_current(first_online));
+        assert!(registration_generation_is_current(second_online));
+
+        assert_eq!(registration_generation_for_status("offline"), None);
+        assert!(!registration_generation_is_current(second_online));
     }
 }
