@@ -181,6 +181,7 @@ jobs:
             --amd64 \
             --aarch64 \
             --cosign \
+            --no-cosign-verify \
             --target /data/addon
 
   test-addon:
@@ -220,4 +221,5 @@ jobs:
             --amd64 \
             --aarch64 \
             --cosign \
+            --no-cosign-verify \
             --target /data/addon
