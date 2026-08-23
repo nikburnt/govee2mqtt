@@ -1,6 +1,6 @@
 name: Govee to MQTT Bridge (2FA Fork)
 image: ghcr.io/nikburnt/govee2mqtt-{arch}
-version: "2026.08.23-2fa1"
+version: "2026.08.23-2fa2"
 slug: govee2mqtt
 description: Control Govee Devices
 url: https://github.com/nikburnt/govee2mqtt
