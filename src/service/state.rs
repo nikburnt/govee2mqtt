@@ -1,15 +1,19 @@
 use crate::ble::{Base64HexBytes, SetHumidifierMode, SetHumidifierNightlightParams};
 use crate::lan_api::{Client as LanClient, DeviceStatus as LanDeviceStatus, LanDevice};
-use crate::platform_api::{DeviceCapability, DeviceType, GoveeApiClient};
+use crate::platform_api::{DeviceCapability, DeviceType, GoveeApiClient, HttpDeviceInfo};
 use crate::service::coordinator::Coordinator;
 use crate::service::device::Device;
 use crate::service::hass::{topic_safe_id, HassClient};
 use crate::service::iot::IotClient;
+use crate::service::offline::OfflineStore;
+use crate::service::scenes::LocalScene;
 use crate::temperature::{TemperatureScale, TemperatureValue};
 use crate::undoc_api::GoveeUndocumentedApi;
 use anyhow::Context;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard, Semaphore};
@@ -26,13 +30,54 @@ pub struct State {
     hass_client: Mutex<Option<HassClient>>,
     hass_discovery_prefix: Mutex<String>,
     temperature_scale: Mutex<TemperatureScale>,
+    pub(crate) one_clicks: Mutex<BTreeMap<String, LocalScene>>,
+    offline_store: Mutex<Option<OfflineStore>>,
 }
 
 pub type StateHandle = Arc<State>;
 
+#[derive(Serialize, Deserialize)]
+pub struct SavedRoom {
+    pub sku: String,
+    pub device: String,
+    pub room_name: Option<String>,
+}
+
 impl State {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub async fn restore_offline(&self, path: &Path) -> anyhow::Result<()> {
+        let store = OfflineStore::open(path)?;
+        let devices: Vec<HttpDeviceInfo> = store.load("platform-devices-v1")?;
+        let rooms: Vec<SavedRoom> = store.load("rooms-v1")?;
+        let scenes = store.load("one-clicks-v1")?;
+        for info in devices {
+            let mut device = self.device_mut(&info.sku, &info.device).await;
+            device.http_device_info = Some(info);
+        }
+        for room in rooms {
+            self.device_mut(&room.sku, &room.device)
+                .await
+                .saved_room_name = room.room_name;
+        }
+        *self.one_clicks.lock().await = scenes;
+        *self.offline_store.lock().await = Some(store);
+        Ok(())
+    }
+
+    pub(crate) async fn save_offline<T: Serialize>(
+        &self,
+        name: &str,
+        data: &T,
+    ) -> anyhow::Result<()> {
+        self.offline_store
+            .lock()
+            .await
+            .as_ref()
+            .context("offline storage is not initialized")?
+            .save(name, data)
     }
 
     pub async fn set_temperature_scale(&self, scale: TemperatureScale) {
@@ -697,4 +742,56 @@ pub fn sort_and_dedup_scenes(mut scenes: Vec<String>) -> Vec<String> {
     scenes.sort_by_key(|s| s.to_ascii_lowercase());
     scenes.dedup();
     scenes
+}
+
+#[cfg(test)]
+mod offline_tests {
+    use super::*;
+    use crate::service::hass::topic_safe_id;
+
+    #[tokio::test]
+    async fn offline_restore_preserves_identity_without_restoring_live_state() -> anyhow::Result<()>
+    {
+        let path =
+            std::env::temp_dir().join(format!("govee-metadata-{}.sqlite", uuid::Uuid::new_v4()));
+        let metadata = HttpDeviceInfo {
+            sku: "H61F5".to_string(),
+            device: "AA:BB:CC:DD".to_string(),
+            device_name: "Mirror".to_string(),
+            device_type: DeviceType::Light,
+            capabilities: vec![],
+        };
+        let mut original = Device::new(&metadata.sku, &metadata.device);
+        original.set_http_device_info(metadata.clone());
+        {
+            let state = State::new();
+            state.restore_offline(&path).await?;
+            state
+                .save_offline("platform-devices-v1", &vec![metadata.clone()])
+                .await?;
+            state
+                .save_offline(
+                    "rooms-v1",
+                    &vec![SavedRoom {
+                        sku: metadata.sku.clone(),
+                        device: metadata.device.clone(),
+                        room_name: Some("Bathroom".to_string()),
+                    }],
+                )
+                .await?;
+        }
+        {
+            let state = State::new();
+            state.restore_offline(&path).await?;
+            let restored = state.device_by_id(&metadata.device).await.unwrap();
+            assert_eq!(restored.name(), original.name());
+            assert_eq!(topic_safe_id(&restored), topic_safe_id(&original));
+            assert_eq!(restored.room_name(), Some("Bathroom"));
+            assert!(restored.device_state().is_none());
+            assert!(restored.lan_device.is_none());
+            assert!(state.get_platform_client().await.is_none());
+        }
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
 }

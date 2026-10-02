@@ -125,7 +125,7 @@ pub struct HassClient {
 }
 
 impl HassClient {
-    async fn register_with_hass(&self, state: &StateHandle) -> anyhow::Result<()> {
+    pub(crate) async fn register_with_hass(&self, state: &StateHandle) -> anyhow::Result<()> {
         let entities = enumerate_all_entites(state).await?;
 
         // Register the configs
@@ -426,22 +426,7 @@ async fn mqtt_oneclick(
 ) -> anyhow::Result<()> {
     log::info!("mqtt_oneclick: {name}");
 
-    let undoc = state
-        .get_undoc_client()
-        .await
-        .ok_or_else(|| anyhow::anyhow!("Undoc API client is not available"))?;
-    let items = undoc.parse_one_clicks().await?;
-    let item = items
-        .iter()
-        .find(|item| item.name == name)
-        .ok_or_else(|| anyhow::anyhow!("didn't find item {name}"))?;
-
-    let iot = state
-        .get_iot_client()
-        .await
-        .ok_or_else(|| anyhow::anyhow!("AWS IoT client is not available"))?;
-
-    iot.activate_one_click(item).await
+    state.activate_one_click(&name).await
 }
 
 #[derive(Deserialize)]

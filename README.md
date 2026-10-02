@@ -20,7 +20,7 @@ via the [Home Assistant MQTT Integration](https://www.home-assistant.io/integrat
 |-------|--------|-------------|
 |DIY Scenes|API Key|Find in the list of Effects for the light in Home Assistant|
 |Music Modes|API Key|Find in the list of Effects for the light in Home Assistant|
-|Tap-to-Run / One Click Scene|IoT|Find in the overall list of Scenes in Home Assistant, as well as under the `Govee to MQTT` device|
+|Tap-to-Run / One Click Scene|Account for import, LAN for execution|Saved locally; find under Scenes and the `Govee to MQTT` device. See limitations below.|
 |Live Device Status Updates|LAN and/or IoT|Devices typically report most changes within a couple of seconds.|
 |Segment Color|API Key|Find the `Segment 00X` light entities associated with your main light device in Home Assistant|
 
@@ -33,6 +33,30 @@ via the [Home Assistant MQTT Integration](https://www.home-assistant.io/integrat
   on supported devices and that the LAN API protocol is functional on your network
 
 ## Usage
+
+### Offline Tap-to-Run scenes (this fork)
+
+The bridge imports Tap-to-Run commands at startup and every ten minutes when
+Govee account access is available. Each successful import adds new scenes and
+replaces commands of existing scenes with the same group/name. Import never
+executes a scene. Failed imports retain the last saved copy; scenes missing from
+a response are retained too.
+
+Scenes and device naming metadata are stored in `govee2mqtt-offline.sqlite` in
+`GOVEE_CACHE_DIR` (the add-on's persistent data directory). This database does not
+expire and is not removed by **Purge Caches**. Import once with internet access
+before relying on offline operation. Cloud discovery failures no longer prevent
+startup; discovery and import are retried periodically.
+
+HA and HTTP One-Click calls use saved commands over LAN, without cloud fallback.
+This initial implementation supports `ptReal` scene packets, whole-device
+`turn`, `colorwc`, and H61F5 percentage `brightness` commands. Brightness on other
+models is rejected until its scale is verified (IoT scales vary by model).
+Other command formats, execution rules, and missing LAN targets
+are rejected before sending any scene command, with the reason in the log and
+the HTTP scene list. Device/firmware support for `ptReal` must be tested: a
+successful UDP send is not confirmation that the effect was applied. The
+explicit `undoc one-click` diagnostic CLI command still uses AWS.
 
 * [Installing the HASS Add-On](docs/ADDON.md) - for HAOS and Supervised HASS users
 * [Running it in Docker](docs/DOCKER.md)
@@ -60,4 +84,3 @@ Control](https://github.com/wez/govee-lan-hass/).
 
 The AWS IoT support was made possible by the work of @bwp91 in
 [homebridge-govee](https://github.com/bwp91/homebridge-govee/).
-

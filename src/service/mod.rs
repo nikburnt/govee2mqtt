@@ -3,5 +3,7 @@ pub mod device;
 pub mod hass;
 pub mod http;
 pub mod iot;
+pub mod offline;
 pub mod quirks;
+pub mod scenes;
 pub mod state;

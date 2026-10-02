@@ -620,33 +620,44 @@ impl GoveeUndocumentedApi {
                 allow_stale: true,
             },
             async {
-                let response = reqwest::Client::builder()
-                    .timeout(Duration::from_secs(10))
-                    .build()?
-                    .request(
-                        Method::GET,
-                        "https://app2.govee.com/bff-app/v1/exec-plat/home",
-                    )
-                    .header("Authorization", format!("Bearer {community_token}"))
-                    .header("appVersion", APP_VERSION)
-                    .header("clientId", &self.client_id)
-                    .header("clientType", "1")
-                    .header("iotVersion", "0")
-                    .header("timestamp", ms_timestamp())
-                    .header("User-Agent", user_agent())
-                    .send()
-                    .await?;
-
-                if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-                    self.invalidate_community_login();
-                }
-
-                let resp: OneClickResponse = http_response_body(response).await?;
-
-                Ok(CacheComputeResult::Value(resp.data.components))
+                Ok(CacheComputeResult::Value(
+                    self.fetch_one_click_shortcuts(community_token).await?,
+                ))
             },
         )
         .await
+    }
+
+    pub async fn fetch_one_click_shortcuts(
+        &self,
+        community_token: &str,
+    ) -> anyhow::Result<Vec<OneClickComponent>> {
+        let response = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?
+            .request(
+                Method::GET,
+                "https://app2.govee.com/bff-app/v1/exec-plat/home",
+            )
+            .header("Authorization", format!("Bearer {community_token}"))
+            .header("appVersion", APP_VERSION)
+            .header("clientId", &self.client_id)
+            .header("clientType", "1")
+            .header("iotVersion", "0")
+            .header("timestamp", ms_timestamp())
+            .header("User-Agent", user_agent())
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.invalidate_community_login();
+        }
+        let resp: OneClickResponse = http_response_body(response).await?;
+        anyhow::ensure!(
+            resp.status == 200,
+            "One-Click API returned status {}",
+            resp.status
+        );
+        Ok(resp.data.components)
     }
 
     pub async fn parse_one_clicks(&self) -> anyhow::Result<Vec<ParsedOneClick>> {

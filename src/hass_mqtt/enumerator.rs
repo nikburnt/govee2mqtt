@@ -46,34 +46,25 @@ async fn enumerate_global_entities(
 }
 
 async fn enumerate_scenes(state: &StateHandle, entities: &mut EntityList) -> anyhow::Result<()> {
-    if let Some(undoc) = state.get_undoc_client().await {
-        match undoc.parse_one_clicks().await {
-            Ok(items) => {
-                for oc in items {
-                    let unique_id = format!(
-                        "gv2mqtt-one-click-{}",
-                        Uuid::new_v5(&Uuid::NAMESPACE_DNS, oc.name.as_bytes()).simple()
-                    );
-                    entities.add(SceneConfig {
-                        base: EntityConfig {
-                            availability_topic: availability_topic(),
-                            name: Some(oc.name.to_string()),
-                            entity_category: None,
-                            origin: Origin::default(),
-                            device: Device::this_service(),
-                            unique_id: unique_id.clone(),
-                            device_class: None,
-                            icon: None,
-                        },
-                        command_topic: oneclick_topic(),
-                        payload_on: oc.name,
-                    });
-                }
-            }
-            Err(err) => {
-                log::warn!("Failed to parse one-clicks: {err:#}");
-            }
-        }
+    for oc in state.saved_one_clicks().await {
+        let unique_id = format!(
+            "gv2mqtt-one-click-{}",
+            Uuid::new_v5(&Uuid::NAMESPACE_DNS, oc.name.as_bytes()).simple()
+        );
+        entities.add(SceneConfig {
+            base: EntityConfig {
+                availability_topic: availability_topic(),
+                name: Some(oc.name.to_string()),
+                entity_category: None,
+                origin: Origin::default(),
+                device: Device::this_service(),
+                unique_id: unique_id.clone(),
+                device_class: None,
+                icon: None,
+            },
+            command_topic: oneclick_topic(),
+            payload_on: oc.name,
+        });
     }
 
     Ok(())

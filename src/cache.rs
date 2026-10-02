@@ -13,14 +13,16 @@ use std::time::Duration;
 pub static CACHE: Lazy<ArcSwap<Cache>> =
     Lazy::new(|| open_cache().expect("failed to initialize cache").into());
 
-fn cache_file_name() -> PathBuf {
-    let cache_dir = std::env::var("GOVEE_CACHE_DIR")
+pub(crate) fn cache_dir() -> PathBuf {
+    std::env::var("GOVEE_CACHE_DIR")
         .ok()
         .map(PathBuf::from)
         .or_else(dirs_next::cache_dir)
-        .expect("failed to resolve cache dir");
+        .expect("failed to resolve cache dir")
+}
 
-    cache_dir.join("govee2mqtt-cache.sqlite")
+fn cache_file_name() -> PathBuf {
+    cache_dir().join("govee2mqtt-cache.sqlite")
 }
 
 fn open_cache() -> anyhow::Result<Arc<Cache>> {

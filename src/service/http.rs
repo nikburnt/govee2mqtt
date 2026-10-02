@@ -188,13 +188,7 @@ async fn device_list_scenes(
 }
 
 async fn list_one_clicks(State(state): State<StateHandle>) -> Result<Response, Response> {
-    let undoc = state
-        .get_undoc_client()
-        .await
-        .ok_or_else(|| anyhow::anyhow!("Undoc API client is not available"))
-        .map_err(generic)?;
-    let items = undoc.parse_one_clicks().await.map_err(generic)?;
-
+    let items = state.saved_one_clicks().await;
     Ok(Json(items).into_response())
 }
 
@@ -202,25 +196,15 @@ async fn activate_one_click(
     State(state): State<StateHandle>,
     Path(name): Path<String>,
 ) -> Result<Response, Response> {
-    let undoc = state
-        .get_undoc_client()
+    if !state
+        .saved_one_clicks()
         .await
-        .ok_or_else(|| anyhow::anyhow!("Undoc API client is not available"))
-        .map_err(generic)?;
-    let items = undoc.parse_one_clicks().await.map_err(generic)?;
-    let item = items
         .iter()
-        .find(|item| item.name == name)
-        .ok_or_else(|| anyhow::anyhow!("didn't find item {name}"))
-        .map_err(not_found)?;
-
-    let iot = state
-        .get_iot_client()
-        .await
-        .ok_or_else(|| anyhow::anyhow!("AWS IoT client is not available"))
-        .map_err(generic)?;
-
-    iot.activate_one_click(item).await.map_err(generic)?;
+        .any(|item| item.name == name)
+    {
+        return Err(not_found(anyhow::anyhow!("didn't find item {name}")));
+    }
+    state.activate_one_click(&name).await.map_err(generic)?;
 
     Ok(response_with_code(StatusCode::OK, "ok"))
 }

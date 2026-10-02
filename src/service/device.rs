@@ -32,6 +32,7 @@ pub struct Device {
 
     pub undoc_device_info: Option<UndocDeviceInfo>,
     pub last_undoc_device_info_update: Option<DateTime<Utc>>,
+    pub saved_room_name: Option<String>,
 
     pub iot_device_status: Option<LanDeviceStatus>,
     pub last_iot_device_status_update: Option<DateTime<Utc>>,
@@ -134,7 +135,7 @@ impl Device {
         if let Some(info) = &self.undoc_device_info {
             return info.room_name.as_deref();
         }
-        None
+        self.saved_room_name.as_deref()
     }
 
     /// compute a name from the SKU and the last couple of bytes from the

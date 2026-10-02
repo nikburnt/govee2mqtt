@@ -168,7 +168,7 @@ impl Default for DiscoOptions {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "cmd", content = "data")]
 pub enum Request {
     #[serde(rename = "scan")]
@@ -330,7 +330,7 @@ struct ResponseWrapper {
     msg: Response,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum AccountTopic {
     #[serde(rename = "reserve")]
     Reserve,

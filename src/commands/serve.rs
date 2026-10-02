@@ -4,7 +4,7 @@ use crate::service::device::Device;
 use crate::service::hass::spawn_hass_integration;
 use crate::service::http::run_http_server;
 use crate::service::iot::start_iot_client;
-use crate::service::state::StateHandle;
+use crate::service::state::{SavedRoom, StateHandle};
 use crate::undoc_api::GoveeUndocumentedApi;
 use crate::version_info::govee_version;
 use crate::UndocApiArguments;
@@ -13,7 +13,7 @@ use chrono::Utc;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 
 pub static POLL_INTERVAL: Lazy<chrono::Duration> = Lazy::new(|| chrono::Duration::seconds(900));
 
@@ -119,7 +119,9 @@ async fn enumerate_devices_via_platform_api(
     };
 
     log::info!("Querying platform API for device list");
-    for info in client.get_devices().await? {
+    let devices = client.get_devices().await?;
+    state.save_offline("platform-devices-v1", &devices).await?;
+    for info in devices {
         let mut device = state.device_mut(&info.sku, &info.device).await;
         device.set_http_device_info(info);
     }
@@ -131,10 +133,10 @@ async fn enumerate_devices_via_undo_api(
     client: Option<GoveeUndocumentedApi>,
     args: &UndocApiArguments,
 ) -> anyhow::Result<()> {
-    let (client, needs_start) = match client {
-        Some(client) => (client, true),
+    let client = match client {
+        Some(client) => client,
         None => match state.get_undoc_client().await {
-            Some(client) => (client, false),
+            Some(client) => client,
             None => return Ok(()),
         },
     };
@@ -146,78 +148,107 @@ async fn enumerate_devices_via_undo_api(
     for group in info.groups {
         group_by_id.insert(group.group_id, group.group_name);
     }
+    let rooms: Vec<SavedRoom> = info
+        .devices
+        .iter()
+        .map(|entry| SavedRoom {
+            sku: entry.sku.clone(),
+            device: entry.device.clone(),
+            room_name: group_by_id.get(&entry.group_id).cloned(),
+        })
+        .collect();
+    state.save_offline("rooms-v1", &rooms).await?;
     for entry in info.devices {
         let mut device = state.device_mut(&entry.sku, &entry.device).await;
         let room_name = group_by_id.get(&entry.group_id).map(|name| name.as_str());
         device.set_undoc_device_info(entry, room_name);
     }
 
-    if needs_start {
+    if state.get_iot_client().await.is_none() {
         start_iot_client(args, state.clone(), Some(acct)).await?;
     }
     Ok(())
 }
 
-const ISSUE_76_EXPLANATION: &str = "Startup cannot automatically continue because entity names\n\
-    could become inconsistent especially across frequent similar\n\
-    intermittent issues if/as they occur on an ongoing basis.\n\
-    Please see https://github.com/wez/govee2mqtt/issues/76\n\
-    A workaround is to remove the Govee API credentials from your\n\
-    configuration, which will cause this govee2mqtt to use only\n\
-    the LAN API. Two consequences of that will be loss of control\n\
-    over devices that do not support the LAN API, and also devices\n\
-    changing entity ID to less descriptive names due to lack of\n\
-    metadata availability via the LAN API.";
+const CLOUD_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
+
+async fn refresh_saved_scenes(state: &StateHandle) {
+    match timeout(CLOUD_DISCOVERY_TIMEOUT, state.refresh_one_clicks()).await {
+        Ok(Ok(true)) => {
+            if let Some(hass) = state.get_hass_client().await {
+                if let Err(err) = hass.register_with_hass(state).await {
+                    log::warn!("Registering refreshed One-Click scenes: {err:#}");
+                }
+            }
+        }
+        Ok(Ok(false)) => {}
+        Ok(Err(err)) => log::warn!("One-Click refresh failed; keeping saved scenes: {err:#}"),
+        Err(err) => log::warn!("One-Click refresh timed out; keeping saved scenes: {err}"),
+    }
+}
 
 impl ServeCommand {
     pub async fn run(&self, args: &crate::Args) -> anyhow::Result<()> {
         log::info!("Starting service. version {}", govee_version());
         let state = Arc::new(crate::service::state::State::new());
+        let cache_dir = crate::cache::cache_dir();
+        std::fs::create_dir_all(&cache_dir)?;
+        state
+            .restore_offline(&cache_dir.join("govee2mqtt-offline.sqlite"))
+            .await?;
 
         // First, use the HTTP APIs to determine the list of devices and
         // their names.
 
         if let Ok(client) = args.api_args.api_client() {
-            if let Err(err) =
-                enumerate_devices_via_platform_api(state.clone(), Some(client.clone())).await
+            match timeout(
+                CLOUD_DISCOVERY_TIMEOUT,
+                enumerate_devices_via_platform_api(state.clone(), Some(client.clone())),
+            )
+            .await
             {
-                anyhow::bail!(
-                    "Error during initial platform API discovery: {err:#}\n{ISSUE_76_EXPLANATION}"
-                );
+                Ok(Ok(())) => state.set_platform_client(client.clone()).await,
+                result => log::warn!(
+                    "Initial platform discovery failed; using saved metadata and LAN: {result:?}"
+                ),
             }
-
-            // only record the client after we've completed the
-            // initial platform disco attempt
-            state.set_platform_client(client).await;
 
             // spawn periodic discovery task
             let state = state.clone();
             tokio::spawn(async move {
                 loop {
                     sleep(Duration::from_secs(600)).await;
-                    if let Err(err) = enumerate_devices_via_platform_api(state.clone(), None).await
+                    match timeout(
+                        CLOUD_DISCOVERY_TIMEOUT,
+                        enumerate_devices_via_platform_api(state.clone(), Some(client.clone())),
+                    )
+                    .await
                     {
-                        log::error!("Error during periodic platform API discovery: {err:#}");
+                        Ok(Ok(())) => state.set_platform_client(client.clone()).await,
+                        result => log::warn!(
+                            "Periodic platform discovery failed; retaining metadata: {result:?}"
+                        ),
                     }
                 }
             });
         }
         if let Ok(client) = args.undoc_args.api_client() {
-            if let Err(err) = enumerate_devices_via_undo_api(
-                state.clone(),
-                Some(client.clone()),
-                &args.undoc_args,
+            state.set_undoc_client(client.clone()).await;
+            if let result @ (Ok(Err(_)) | Err(_)) = timeout(
+                CLOUD_DISCOVERY_TIMEOUT,
+                enumerate_devices_via_undo_api(
+                    state.clone(),
+                    Some(client.clone()),
+                    &args.undoc_args,
+                ),
             )
             .await
             {
-                anyhow::bail!(
-                    "Error during initial undoc API discovery: {err:#}\n{ISSUE_76_EXPLANATION}"
+                log::warn!(
+                    "Initial account discovery failed; using saved metadata and LAN: {result:?}"
                 );
             }
-
-            // only record the client after we've completed the
-            // initial undoc disco attempt
-            state.set_undoc_client(client).await;
+            refresh_saved_scenes(&state).await;
 
             // spawn periodic discovery task
             let state = state.clone();
@@ -225,11 +256,17 @@ impl ServeCommand {
             tokio::spawn(async move {
                 loop {
                     sleep(Duration::from_secs(600)).await;
-                    if let Err(err) =
-                        enumerate_devices_via_undo_api(state.clone(), None, &args).await
+                    if let result @ (Ok(Err(_)) | Err(_)) = timeout(
+                        CLOUD_DISCOVERY_TIMEOUT,
+                        enumerate_devices_via_undo_api(state.clone(), None, &args),
+                    )
+                    .await
                     {
-                        log::error!("Error during periodic undoc API discovery: {err:#}");
+                        log::warn!(
+                            "Periodic account discovery failed; retaining metadata: {result:?}"
+                        );
                     }
+                    refresh_saved_scenes(&state).await;
                 }
             });
         }
