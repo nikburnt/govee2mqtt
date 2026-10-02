@@ -1,5 +1,6 @@
 ARG BUILD_FROM
-FROM ghcr.io/nikburnt/govee2mqtt:latest AS govee2mqtt
+ARG GOVEE_VERSION=latest
+FROM ghcr.io/nikburnt/govee2mqtt:${GOVEE_VERSION} AS govee2mqtt
 FROM $BUILD_FROM
 COPY run.sh /run.sh
 COPY --from=govee2mqtt /app/govee /app/
