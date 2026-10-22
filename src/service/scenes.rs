@@ -21,7 +21,7 @@ struct LocalAction {
     request: Request,
 }
 
-fn local_request(sku: &str, value: &Value) -> anyhow::Result<Request> {
+fn local_request(value: &Value) -> anyhow::Result<Request> {
     let msg = value.get("msg").context("missing command envelope")?;
     let cmd = msg["cmd"].as_str().context("missing command name")?;
     let data = msg.get("data").context("missing command data")?;
@@ -55,9 +55,6 @@ fn local_request(sku: &str, value: &Value) -> anyhow::Result<Request> {
             Ok(Request::Turn { value: data.val })
         }
         "brightness" => {
-            // H61F5 Tap-to-Run and BLE captures use 0-100. Other models may
-            // use 0-254 over IoT; do not guess from the individual value.
-            ensure!(sku == "H61F5", "unverified brightness scale for {sku}");
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
             struct Data {
@@ -117,7 +114,7 @@ impl LocalScene {
                     actions.push(LocalAction {
                         device: device.clone(),
                         sku: sku.clone(),
-                        request: local_request(&sku, &command.iot_msg)
+                        request: local_request(&command.iot_msg)
                             .with_context(|| format!("device {sku} {device}"))?,
                     });
                 }
@@ -339,6 +336,33 @@ mod tests {
     }
 
     #[test]
+    fn imports_percentage_brightness_without_a_model_allowlist() -> anyhow::Result<()> {
+        for sku in ["H6076", "H61F5", "unlisted-model"] {
+            for brightness in [0, 10, 100] {
+                let mut groups = fixture();
+                let rule = &mut fixture_scene(&mut groups).iot_rules[0];
+                rule.device_obj.sku = Some(sku.to_string());
+                let mut entry = rule.rule[0].clone();
+                entry.iot_msg = json!({"msg":{"cmd":"brightness","data":{"val":brightness}}});
+                rule.rule.push(entry);
+                let scenes = merge_scenes(&BTreeMap::new(), groups)?;
+                let scene = scenes.values().find(|s| s.name.ends_with("woot")).unwrap();
+                assert!(
+                    scene.unsupported.is_none(),
+                    "{sku}: {:?}",
+                    scene.unsupported
+                );
+                assert_eq!(scene.actions.len(), 3);
+                assert_eq!(
+                    serde_json::to_value(&scene.actions[2].request)?,
+                    json!({"cmd":"brightness","data":{"value":brightness}})
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn unknown_action_invalidates_the_entire_updated_scene() -> anyhow::Result<()> {
         let first = merge_scenes(&BTreeMap::new(), fixture())?;
         let mut groups = fixture();
@@ -351,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_frames_power_values_and_unverified_formats() {
+    fn rejects_invalid_frames_power_values_and_unsupported_command_shapes() {
         for msg in [
             json!({"cmd":"ptReal","data":{"command":["invalid"]}}),
             json!({"cmd":"ptReal","data":{"command":[]}}),
@@ -363,15 +387,8 @@ mod tests {
             json!({"cmd":"colorwc","data":{"color":{"r":1,"g":0,"b":0,"channel":2},"colorTemInKelvin":0}}),
             json!({"cmd":"colorwc","data":{"color":{"r":1,"g":0,"b":0},"colorTemInKelvin":50000}}),
         ] {
-            assert!(local_request("H61F5", &json!({"msg":msg})).is_err());
+            assert!(local_request(&json!({"msg":msg})).is_err());
         }
-        assert!(local_request(
-            "unknown-model",
-            &json!({"msg":{
-                "cmd":"brightness","data":{"val":100}
-            }})
-        )
-        .is_err());
     }
 
     #[tokio::test]

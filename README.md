@@ -50,8 +50,8 @@ startup; discovery and import are retried periodically.
 
 HA and HTTP One-Click calls use saved commands over LAN, without cloud fallback.
 This initial implementation supports `ptReal` scene packets, whole-device
-`turn`, `colorwc`, and H61F5 percentage `brightness` commands. Brightness on other
-models is rejected until its scale is verified (IoT scales vary by model).
+`turn`, `colorwc`, and percentage `brightness` commands (0-100), without a
+model allowlist. Brightness values are forwarded unchanged to the LAN command.
 Other command formats, execution rules, and missing LAN targets
 are rejected before sending any scene command, with the reason in the log and
 the HTTP scene list. Device/firmware support for `ptReal` must be tested: a
