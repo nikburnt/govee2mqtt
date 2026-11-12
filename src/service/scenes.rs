@@ -173,8 +173,7 @@ impl State {
         let Some(client) = self.get_undoc_client().await else {
             return Ok(false);
         };
-        let token = client.login_community().await?;
-        let groups = client.fetch_one_click_shortcuts(&token).await?;
+        let groups = client.fetch_one_click_shortcuts().await?;
         self.store_one_clicks(groups).await
     }
 

@@ -42,6 +42,13 @@ replaces commands of existing scenes with the same group/name. Import never
 executes a scene. Failed imports retain the last saved copy; scenes missing from
 a response are retained too.
 
+Tap-to-Run import uses the Govee app account session, not a Community token.
+Valid sessions are reused; expired sessions renew with the configured credentials
+and stable client ID. An HTTP 401 or HTTP 200 with JSON status 401 discards only
+that account session and retries the scene read once. Other cloud errors keep
+saved scenes without repeated login attempts. A genuine Govee 2FA challenge
+still requires verification; normal refresh does not request a code preemptively.
+
 Scenes and device naming metadata are stored in `govee2mqtt-offline.sqlite` in
 `GOVEE_CACHE_DIR` (the add-on's persistent data directory). This database does not
 expire and is not removed by **Purge Caches**. Import once with internet access

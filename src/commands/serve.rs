@@ -181,7 +181,7 @@ async fn refresh_saved_scenes(state: &StateHandle) {
                 }
             }
         }
-        Ok(Ok(false)) => {}
+        Ok(Ok(false)) => log::info!("One-Click refresh completed; saved scenes unchanged"),
         Ok(Err(err)) => log::warn!("One-Click refresh failed; keeping saved scenes: {err:#}"),
         Err(err) => log::warn!("One-Click refresh timed out; keeping saved scenes: {err}"),
     }

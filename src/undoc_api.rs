@@ -4,7 +4,7 @@ use crate::lan_api::{boolean_int, truthy};
 use crate::opt_env_var;
 use crate::platform_api::{
     from_json, http_response_body, DeviceCapability, DeviceCapabilityKind, DeviceParameters,
-    EnumOption,
+    EnumOption, HttpRequestFailed,
 };
 use anyhow::Context;
 use reqwest::Method;
@@ -176,6 +176,8 @@ pub struct GoveeUndocumentedApi {
     password: String,
     client_id: String,
     two_fa_code: Option<String>,
+    #[cfg(test)]
+    test_origin: Option<String>,
 }
 
 impl GoveeUndocumentedApi {
@@ -197,7 +199,17 @@ impl GoveeUndocumentedApi {
             password,
             client_id,
             two_fa_code: optional_trimmed(two_fa_code),
+            #[cfg(test)]
+            test_origin: None,
         }
+    }
+
+    fn api_url(&self, path: &str) -> String {
+        #[cfg(test)]
+        if let Some(origin) = &self.test_origin {
+            return format!("{origin}{path}");
+        }
+        format!("https://app2.govee.com{path}")
     }
 
     fn login_request_body(&self) -> JsonValue {
@@ -242,7 +254,7 @@ impl GoveeUndocumentedApi {
             .build()?
             .request(
                 Method::POST,
-                "https://app2.govee.com/account/rest/account/v1/verification",
+                self.api_url("/account/rest/account/v1/verification"),
             )
             .header("appVersion", APP_VERSION)
             .header("clientId", &self.client_id)
@@ -331,18 +343,40 @@ impl GoveeUndocumentedApi {
         .await
     }
 
-    pub fn invalidate_account_login(&self) {
-        crate::cache::invalidate_key("undoc-api", "account-info").ok();
+    pub fn invalidate_account_login(&self) -> anyhow::Result<()> {
+        crate::cache::invalidate_key("undoc-api", "account-info")
+    }
+
+    fn account_token_rejected(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<reqwest::Error>()
+            .and_then(|error| error.status())
+            == Some(reqwest::StatusCode::UNAUTHORIZED)
+            || HttpRequestFailed::from_err(error)
+                .is_some_and(|error| error.status() == reqwest::StatusCode::UNAUTHORIZED)
+    }
+
+    async fn account_response<T: DeserializeOwned>(
+        &self,
+        response: reqwest::Response,
+    ) -> anyhow::Result<T> {
+        let result = match response.error_for_status_ref() {
+            Err(error) if error.status() == Some(reqwest::StatusCode::UNAUTHORIZED) => {
+                Err(error.into())
+            }
+            _ => http_response_body(response).await,
+        };
+        if result.as_ref().is_err_and(Self::account_token_rejected) {
+            self.invalidate_account_login()?;
+        }
+        result
     }
 
     async fn login_account_impl(&self) -> anyhow::Result<CacheComputeResult<LoginAccountResponse>> {
         let response = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()?
-            .request(
-                Method::POST,
-                "https://app2.govee.com/account/rest/account/v2/login",
-            )
+            .request(Method::POST, self.api_url("/account/rest/account/v2/login"))
             .header("appVersion", APP_VERSION)
             .header("clientId", &self.client_id)
             .header("clientType", "1")
@@ -454,10 +488,7 @@ impl GoveeUndocumentedApi {
         let response = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()?
-            .request(
-                Method::POST,
-                "https://app2.govee.com/device/rest/devices/v1/list",
-            )
+            .request(Method::POST, self.api_url("/device/rest/devices/v1/list"))
             .header("Authorization", format!("Bearer {token}"))
             .header("appVersion", APP_VERSION)
             .header("clientId", &self.client_id)
@@ -468,75 +499,9 @@ impl GoveeUndocumentedApi {
             .send()
             .await?;
 
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            self.invalidate_account_login();
-        }
-
-        let resp: DevicesResponse = http_response_body(response).await?;
+        let resp: DevicesResponse = self.account_response(response).await?;
 
         Ok(resp)
-    }
-
-    pub fn invalidate_community_login(&self) {
-        crate::cache::invalidate_key("undoc-api", "community-login").ok();
-    }
-
-    /// Login to community-api.govee.com and return the bearer token
-    pub async fn login_community(&self) -> anyhow::Result<String> {
-        cache_get(
-            CacheGetOptions {
-                topic: "undoc-api",
-                key: "community-login",
-                soft_ttl: ONE_DAY,
-                hard_ttl: HALF_DAY,
-                negative_ttl: Duration::from_secs(10),
-                allow_stale: false,
-            },
-            async {
-                let response = reqwest::Client::builder()
-                    .timeout(Duration::from_secs(60))
-                    .build()?
-                    .request(Method::POST, "https://community-api.govee.com/os/v1/login")
-                    .json(&serde_json::json!({
-                        "email": self.email,
-                        "password": self.password,
-                    }))
-                    .send()
-                    .await?;
-
-                #[derive(Deserialize, Debug)]
-                #[allow(non_snake_case, dead_code)]
-                struct Response {
-                    data: ResponseData,
-                    message: String,
-                    status: u64,
-                }
-
-                #[derive(Deserialize, Debug)]
-                #[allow(non_snake_case, dead_code)]
-                struct ResponseData {
-                    email: String,
-                    expiredAt: u64,
-                    headerUrl: String,
-                    id: u64,
-                    nickName: String,
-                    token: String,
-                }
-
-                let resp: Response = http_response_body(response).await?;
-
-                let ts_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("unix epoch in the past")
-                    .as_millis();
-
-                let ttl_ms = resp.data.expiredAt as u128 - ts_ms;
-                let ttl = Duration::from_millis(ttl_ms as u64).min(ONE_DAY);
-
-                Ok(CacheComputeResult::WithTtl(resp.data.token, ttl))
-            },
-        )
-        .await
     }
 
     pub async fn get_scenes_for_device(sku: &str) -> anyhow::Result<Vec<LightEffectCategory>> {
@@ -606,10 +571,7 @@ impl GoveeUndocumentedApi {
         }])
     }
 
-    pub async fn get_saved_one_click_shortcuts(
-        &self,
-        community_token: &str,
-    ) -> anyhow::Result<Vec<OneClickComponent>> {
+    pub async fn get_saved_one_click_shortcuts(&self) -> anyhow::Result<Vec<OneClickComponent>> {
         cache_get(
             CacheGetOptions {
                 topic: "undoc-api",
@@ -621,25 +583,38 @@ impl GoveeUndocumentedApi {
             },
             async {
                 Ok(CacheComputeResult::Value(
-                    self.fetch_one_click_shortcuts(community_token).await?,
+                    self.fetch_one_click_shortcuts().await?,
                 ))
             },
         )
         .await
     }
 
-    pub async fn fetch_one_click_shortcuts(
+    pub async fn fetch_one_click_shortcuts(&self) -> anyhow::Result<Vec<OneClickComponent>> {
+        for attempt in 0..2 {
+            let account = self.login_account_cached().await?;
+            match self
+                .fetch_one_click_shortcuts_with_token(&account.token)
+                .await
+            {
+                Err(error) if attempt == 0 && Self::account_token_rejected(&error) => {
+                    log::info!("Scene API rejected the account session; renewing it once");
+                }
+                result => return result,
+            }
+        }
+        unreachable!("the final scene request always returns")
+    }
+
+    async fn fetch_one_click_shortcuts_with_token(
         &self,
-        community_token: &str,
+        account_token: &str,
     ) -> anyhow::Result<Vec<OneClickComponent>> {
         let response = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()?
-            .request(
-                Method::GET,
-                "https://app2.govee.com/bff-app/v1/exec-plat/home",
-            )
-            .header("Authorization", format!("Bearer {community_token}"))
+            .request(Method::GET, self.api_url("/bff-app/v1/exec-plat/home"))
+            .header("Authorization", format!("Bearer {account_token}"))
             .header("appVersion", APP_VERSION)
             .header("clientId", &self.client_id)
             .header("clientType", "1")
@@ -648,10 +623,7 @@ impl GoveeUndocumentedApi {
             .header("User-Agent", user_agent())
             .send()
             .await?;
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            self.invalidate_community_login();
-        }
-        let resp: OneClickResponse = http_response_body(response).await?;
+        let resp: OneClickResponse = self.account_response(response).await?;
         anyhow::ensure!(
             resp.status == 200,
             "One-Click API returned status {}",
@@ -661,8 +633,7 @@ impl GoveeUndocumentedApi {
     }
 
     pub async fn parse_one_clicks(&self) -> anyhow::Result<Vec<ParsedOneClick>> {
-        let token = self.login_community().await?;
-        let res = self.get_saved_one_click_shortcuts(&token).await?;
+        let res = self.get_saved_one_click_shortcuts().await?;
         let mut result = vec![];
 
         for group in res {
@@ -1127,6 +1098,10 @@ pub fn embedded_json<'de, T: DeserializeOwned, D: serde::de::Deserializer<'de>>(
         ))
     })
 }
+
+#[cfg(test)]
+#[path = "undoc_api_auth_tests.rs"]
+mod auth_tests;
 
 #[cfg(test)]
 mod test {
