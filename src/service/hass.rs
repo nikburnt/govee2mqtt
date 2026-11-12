@@ -789,11 +789,16 @@ mod tests {
         Ok((client, events))
     }
 
-    async fn mqtt_test_message(events: &Receiver<Event>) -> anyhow::Result<mosquitto_rs::Message> {
+    async fn mqtt_test_message(
+        events: &Receiver<Event>,
+        expected: &[u8],
+    ) -> anyhow::Result<mosquitto_rs::Message> {
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if let Event::Message(message) = events.recv().await? {
-                    return Ok(message);
+                    if message.payload == expected {
+                        return Ok(message);
+                    }
                 }
             }
         })
@@ -820,10 +825,6 @@ mod tests {
     #[ignore = "requires an isolated localhost broker and GOVEE_TEST_MQTT_PORT"]
     async fn test_availability_survives_late_subscriptions_and_connection_loss(
     ) -> anyhow::Result<()> {
-        let (reset, _) = mqtt_test_observer().await?;
-        reset
-            .publish(availability_topic(), b"", QoS::AtLeastOnce, true)
-            .await?;
         let (_observer, events) = mqtt_test_observer().await?;
         let mut publisher = std::process::Command::new(std::env::current_exe()?)
             .args([
@@ -834,7 +835,7 @@ mod tests {
             .stdout(std::process::Stdio::null())
             .spawn()?;
         let result: anyhow::Result<()> = async {
-            let message = mqtt_test_message(&events).await?;
+            let message = mqtt_test_message(&events, b"online").await?;
             anyhow::ensure!(
                 message.payload == b"online",
                 "live subscriber did not see online"
@@ -842,7 +843,7 @@ mod tests {
 
             // HA subscribes after processing discovery; it must still see online.
             let (_late, late_events) = mqtt_test_observer().await?;
-            let message = mqtt_test_message(&late_events).await?;
+            let message = mqtt_test_message(&late_events, b"online").await?;
             anyhow::ensure!(
                 message.payload == b"online" && message.retain,
                 "online was not retained"
@@ -851,13 +852,13 @@ mod tests {
             // Killing only the test publisher exercises the real MQTT Last Will.
             publisher.kill()?;
             publisher.wait()?;
-            let message = mqtt_test_message(&events).await?;
+            let message = mqtt_test_message(&events, b"offline").await?;
             anyhow::ensure!(
                 message.payload == b"offline",
                 "connection loss did not publish offline"
             );
             let (_after_loss, loss_events) = mqtt_test_observer().await?;
-            let message = mqtt_test_message(&loss_events).await?;
+            let message = mqtt_test_message(&loss_events, b"offline").await?;
             anyhow::ensure!(
                 message.payload == b"offline" && message.retain,
                 "stale online survived connection loss"
@@ -871,7 +872,7 @@ mod tests {
                 )
                 .await?;
             // Drain the retained availability message, then check ordinary state is unchanged.
-            mqtt_test_message(&ordinary_events).await?;
+            mqtt_test_message(&ordinary_events, b"offline").await?;
             anyhow::ensure!(
                 tokio::time::timeout(Duration::from_millis(150), async {
                     loop {

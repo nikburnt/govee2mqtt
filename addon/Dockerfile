@@ -1,5 +1,5 @@
 ARG BUILD_FROM
-ARG GOVEE_VERSION=2026.11.12-local1
+ARG GOVEE_VERSION=2026.11.12-local2
 FROM ghcr.io/nikburnt/govee2mqtt:${GOVEE_VERSION} AS govee2mqtt
 FROM $BUILD_FROM
 COPY run.sh /run.sh
