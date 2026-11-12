@@ -124,7 +124,24 @@ pub struct HassClient {
     client: Client,
 }
 
+fn create_mqtt_client() -> anyhow::Result<Client> {
+    let client = Client::with_id(
+        &format!("govee2mqtt-{}", uuid::Uuid::new_v4().simple()),
+        true,
+    )?;
+    client.set_last_will(availability_topic(), "offline", QoS::AtLeastOnce, true)?;
+    Ok(client)
+}
+
 impl HassClient {
+    async fn publish_availability(&self) -> anyhow::Result<()> {
+        // Discovery is asynchronous in HA: availability must survive a late subscription.
+        self.client
+            .publish(availability_topic(), "online", QoS::AtLeastOnce, true)
+            .await?;
+        Ok(())
+    }
+
     pub(crate) async fn register_with_hass(&self, state: &StateHandle) -> anyhow::Result<()> {
         let entities = enumerate_all_entites(state).await?;
 
@@ -143,7 +160,7 @@ impl HassClient {
 
         // Mark as available
         log::trace!("register_with_hass: mark as online");
-        self.publish(availability_topic(), "online")
+        self.publish_availability()
             .await
             .context("online -> availability_topic")?;
 
@@ -625,10 +642,7 @@ pub async fn spawn_hass_integration(
     state: StateHandle,
     args: &HassArguments,
 ) -> anyhow::Result<()> {
-    let client = Client::with_id(
-        &format!("govee2mqtt-{}", uuid::Uuid::new_v4().simple()),
-        true,
-    )?;
+    let client = create_mqtt_client()?;
 
     state.set_temperature_scale(args.temperature_scale()?).await;
 
@@ -636,8 +650,6 @@ pub async fn spawn_hass_integration(
     let mqtt_username = args.mqtt_username()?;
     let mqtt_password = args.mqtt_password()?;
     let mqtt_port = args.mqtt_port()?;
-
-    client.set_last_will(availability_topic(), "offline", QoS::AtMostOnce, false)?;
 
     if mqtt_username.is_some() != mqtt_password.is_some() {
         log::error!(
@@ -762,5 +774,123 @@ mod tests {
 
         assert_eq!(registration_generation_for_status("offline"), None);
         assert!(!registration_generation_is_current(second_online));
+    }
+
+    async fn mqtt_test_observer() -> anyhow::Result<(Client, Receiver<Event>)> {
+        let port: u16 = std::env::var("GOVEE_TEST_MQTT_PORT")?.parse()?;
+        let client = Client::with_auto_id()?;
+        let events = client.subscriber().unwrap();
+        client
+            .connect("127.0.0.1", port.into(), Duration::from_secs(5), None)
+            .await?;
+        client
+            .subscribe(&availability_topic(), QoS::AtLeastOnce)
+            .await?;
+        Ok((client, events))
+    }
+
+    async fn mqtt_test_message(events: &Receiver<Event>) -> anyhow::Result<mosquitto_rs::Message> {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Event::Message(message) = events.recv().await? {
+                    return Ok(message);
+                }
+            }
+        })
+        .await?
+    }
+
+    #[tokio::test]
+    #[ignore = "helper process for the isolated MQTT availability regression"]
+    async fn availability_publisher_process() -> anyhow::Result<()> {
+        let port: u16 = std::env::var("GOVEE_TEST_MQTT_PORT")?.parse()?;
+        let client = create_mqtt_client()?;
+        client
+            .connect("127.0.0.1", port.into(), Duration::from_secs(5), None)
+            .await?;
+        let hass = HassClient { client };
+        hass.publish_availability().await?;
+        hass.publish("gv2mqtt/availability-regression/transient", "not retained")
+            .await?;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated localhost broker and GOVEE_TEST_MQTT_PORT"]
+    async fn test_availability_survives_late_subscriptions_and_connection_loss(
+    ) -> anyhow::Result<()> {
+        let (reset, _) = mqtt_test_observer().await?;
+        reset
+            .publish(availability_topic(), b"", QoS::AtLeastOnce, true)
+            .await?;
+        let (_observer, events) = mqtt_test_observer().await?;
+        let mut publisher = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "service::hass::tests::availability_publisher_process",
+                "--ignored",
+            ])
+            .stdout(std::process::Stdio::null())
+            .spawn()?;
+        let result: anyhow::Result<()> = async {
+            let message = mqtt_test_message(&events).await?;
+            anyhow::ensure!(
+                message.payload == b"online",
+                "live subscriber did not see online"
+            );
+
+            // HA subscribes after processing discovery; it must still see online.
+            let (_late, late_events) = mqtt_test_observer().await?;
+            let message = mqtt_test_message(&late_events).await?;
+            anyhow::ensure!(
+                message.payload == b"online" && message.retain,
+                "online was not retained"
+            );
+
+            // Killing only the test publisher exercises the real MQTT Last Will.
+            publisher.kill()?;
+            publisher.wait()?;
+            let message = mqtt_test_message(&events).await?;
+            anyhow::ensure!(
+                message.payload == b"offline",
+                "connection loss did not publish offline"
+            );
+            let (_after_loss, loss_events) = mqtt_test_observer().await?;
+            let message = mqtt_test_message(&loss_events).await?;
+            anyhow::ensure!(
+                message.payload == b"offline" && message.retain,
+                "stale online survived connection loss"
+            );
+
+            let (ordinary, ordinary_events) = mqtt_test_observer().await?;
+            ordinary
+                .subscribe(
+                    "gv2mqtt/availability-regression/transient",
+                    QoS::AtLeastOnce,
+                )
+                .await?;
+            // Drain the retained availability message, then check ordinary state is unchanged.
+            mqtt_test_message(&ordinary_events).await?;
+            anyhow::ensure!(
+                tokio::time::timeout(Duration::from_millis(150), async {
+                    loop {
+                        if let Event::Message(message) = ordinary_events.recv().await? {
+                            if message.topic == "gv2mqtt/availability-regression/transient" {
+                                return Ok::<_, anyhow::Error>(());
+                            }
+                        }
+                    }
+                })
+                .await
+                .is_err(),
+                "ordinary state messages unexpectedly became retained"
+            );
+            Ok(())
+        }
+        .await;
+        let _ = publisher.kill();
+        let _ = publisher.wait();
+        result
     }
 }
